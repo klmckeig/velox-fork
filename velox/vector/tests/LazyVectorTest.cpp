@@ -110,7 +110,7 @@ TEST_F(LazyVectorTest, dictionaryOverRowVectorWithLazyChild) {
           rowVector));
   EXPECT_TRUE(isLazyNotLoaded(*dict.get()));
 
-  SelectivityVector rows(dict->size(), false);
+  SelectivityVector rows(dict->size(), true);
   LazyVector::ensureLoadedRows(dict, rows);
   EXPECT_FALSE(isLazyNotLoaded(*dict.get()));
   // Ensure encoding layer is correctly initialized after lazy loading.

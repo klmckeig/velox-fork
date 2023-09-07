@@ -528,9 +528,23 @@ void ArrayVectorBase::copyRangesImpl(
 
 void RowVector::validate(const VectorValidateOptions& options) const {
   BaseVector::validate(options);
+  std::optional<vector_size_t> lastSetBit;
+
+  if (nulls_) {
+    lastSetBit = bits::findLastBit(nulls_->as<uint64_t>(), 0, size());
+  }
+
   for (auto& child : children_) {
     if (child != nullptr) {
       child->validate(options);
+      if (child->size() < size()) {
+        // Cannot have null nulls buffer if child size < parent size.
+        VELOX_CHECK_NOT_NULL(nulls_);
+
+        // Trailing nulls check: Row cannot have a set bit that's larger than
+        // child size.
+        VELOX_CHECK_GT(child->size(), lastSetBit.value());
+      }
     }
   }
 }
