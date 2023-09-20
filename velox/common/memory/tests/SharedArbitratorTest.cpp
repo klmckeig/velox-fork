@@ -27,7 +27,11 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/common/memory/SharedArbitrator.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/connectors/hive/HiveDataSink.h"
+#include "velox/core/PlanNode.h"
+#include "velox/exec/Driver.h"
 #include "velox/exec/HashBuild.h"
+#include "velox/exec/TableWriter.h"
 #include "velox/exec/Values.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
@@ -246,6 +250,39 @@ class FakeMemoryOperatorFactory : public Operator::PlanNodeTranslator {
   uint32_t maxDrivers_{1};
 };
 
+class FakeMemoryReclaimer : public MemoryReclaimer {
+ public:
+  FakeMemoryReclaimer() = default;
+
+  static std::unique_ptr<MemoryReclaimer> create() {
+    return std::make_unique<FakeMemoryReclaimer>();
+  }
+
+  void enterArbitration() override {
+    auto* driverThreadCtx = driverThreadContext();
+    if (driverThreadCtx == nullptr) {
+      return;
+    }
+    auto* driver = driverThreadCtx->driverCtx.driver;
+    ASSERT_TRUE(driver != nullptr);
+    if (driver->task()->enterSuspended(driver->state()) != StopReason::kNone) {
+      // There is no need for arbitration if the associated task has already
+      // terminated.
+      VELOX_FAIL("Terminate detected when entering suspension");
+    }
+  }
+
+  void leaveArbitration() noexcept override {
+    auto* driverThreadCtx = driverThreadContext();
+    if (driverThreadCtx == nullptr) {
+      return;
+    }
+    auto* driver = driverThreadCtx->driverCtx.driver;
+    ASSERT_TRUE(driver != nullptr);
+    driver->task()->leaveSuspended(driver->state());
+  }
+};
+
 class SharedArbitrationTest : public exec::test::HiveConnectorTestBase {
  protected:
   static void SetUpTestCase() {
@@ -256,7 +293,7 @@ class SharedArbitrationTest : public exec::test::HiveConnectorTestBase {
   }
 
   void SetUp() override {
-    OperatorTestBase::SetUp();
+    HiveConnectorTestBase::SetUp();
 
     setupMemory();
     auto fakeOperatorFactory = std::make_unique<FakeMemoryOperatorFactory>();
@@ -277,7 +314,7 @@ class SharedArbitrationTest : public exec::test::HiveConnectorTestBase {
   }
 
   void TearDown() override {
-    OperatorTestBase::TearDown();
+    HiveConnectorTestBase::TearDown();
   }
 
   void setupMemory(
@@ -294,6 +331,17 @@ class SharedArbitrationTest : public exec::test::HiveConnectorTestBase {
     options.memoryPoolInitCapacity = memoryPoolInitCapacity;
     options.memoryPoolTransferCapacity = memoryPoolTransferCapacity;
     options.checkUsageLeak = true;
+    options.arbitrationStateCheckCb = [](MemoryPool& pool) {
+      const auto* driverThreadCtx = driverThreadContext();
+      if (driverThreadCtx != nullptr) {
+        if (!driverThreadCtx->driverCtx.driver->state().isSuspended) {
+          LOG(ERROR)
+              << "false "
+              << driverThreadCtx->driverCtx.driver->state().toJsonString();
+        }
+        ASSERT_TRUE(driverThreadCtx->driverCtx.driver->state().isSuspended);
+      }
+    };
     memoryManager_ = std::make_unique<MemoryManager>(options);
     ASSERT_EQ(memoryManager_->arbitrator()->kind(), "SHARED");
     arbitrator_ = static_cast<SharedArbitrator*>(memoryManager_->arbitrator());
@@ -320,6 +368,37 @@ class SharedArbitrationTest : public exec::test::HiveConnectorTestBase {
         cache::AsyncDataCache::getInstance(),
         std::move(pool));
     return queryCtx;
+  }
+
+  // Generates the simple table writer plan.
+  core::PlanNodePtr createInsertPlan(
+      PlanBuilder& inputPlan,
+      const RowTypePtr& rowType,
+      const std::string& outputDirectoryPath) {
+    auto insertPlan = inputPlan.tableWrite(
+        rowType,
+        rowType->names(),
+        nullptr,
+        std::make_shared<core::InsertTableHandle>(
+            kHiveConnectorId,
+            makeHiveInsertTableHandle(
+                rowType->names(),
+                rowType->children(),
+                {},
+                nullptr,
+                makeLocationHandle(
+                    outputDirectoryPath,
+                    std::nullopt,
+                    connector::hive::LocationHandle::TableType::kNew),
+                dwio::common::FileFormat::DWRF,
+                common::CompressionKind::CompressionKind_NONE)),
+        false,
+        velox::connector::CommitStrategy::kNoCommit);
+    insertPlan.project({TableWriteTraits::rowCountColumnName()})
+        .singleAggregation(
+            {},
+            {fmt::format("sum({})", TableWriteTraits::rowCountColumnName())});
+    return insertPlan.planNode();
   }
 
   static inline FakeMemoryOperatorFactory* fakeOperatorFactory_;
@@ -663,6 +742,7 @@ DEBUG_ONLY_TEST_F(SharedArbitrationTest, reclaimToOrderBy) {
     waitForAllTasksToBeDeleted();
     const auto newStats = arbitrator_->stats();
     ASSERT_GT(newStats.numReclaimedBytes, oldStats.numReclaimedBytes);
+    ASSERT_GT(newStats.reclaimTimeUs, oldStats.reclaimTimeUs);
   }
 }
 
@@ -921,6 +1001,7 @@ DEBUG_ONLY_TEST_F(SharedArbitrationTest, reclaimToAggregation) {
 
     const auto newStats = arbitrator_->stats();
     ASSERT_GT(newStats.numReclaimedBytes, oldStats.numReclaimedBytes);
+    ASSERT_GT(newStats.reclaimTimeUs, oldStats.reclaimTimeUs);
   }
 }
 
@@ -1211,6 +1292,7 @@ DEBUG_ONLY_TEST_F(SharedArbitrationTest, reclaimToJoinBuilder) {
 
     const auto newStats = arbitrator_->stats();
     ASSERT_GT(newStats.numReclaimedBytes, oldStats.numReclaimedBytes);
+    ASSERT_GT(newStats.reclaimTimeUs, oldStats.reclaimTimeUs);
   }
 }
 
@@ -1807,7 +1889,8 @@ DEBUG_ONLY_TEST_F(
 
   std::shared_ptr<core::QueryCtx> queryCtx = newQueryCtx(kMemoryCapacity);
   std::shared_ptr<core::QueryCtx> fakeCtx = newQueryCtx(kMemoryCapacity);
-  auto fakePool = fakeCtx->pool()->addLeafChild("fakePool");
+  auto fakePool = fakeCtx->pool()->addLeafChild(
+      "fakePool", true, FakeMemoryReclaimer::create());
   std::vector<std::unique_ptr<TestAllocation>> injectAllocations;
   std::atomic<bool> injectAllocationOnce{true};
   SCOPED_TESTVALUE_SET(
@@ -2112,7 +2195,8 @@ DEBUG_ONLY_TEST_F(SharedArbitrationTest, raceBetweenMaybeReserveAndTaskAbort) {
 
   // Create a fake query to hold some memory to trigger memory arbitration.
   auto fakeQueryCtx = newQueryCtx(kMemoryCapacity);
-  auto fakeLeafPool = fakeQueryCtx->pool()->addLeafChild("fakeLeaf");
+  auto fakeLeafPool = fakeQueryCtx->pool()->addLeafChild(
+      "fakeLeaf", true, FakeMemoryReclaimer::create());
   TestAllocation fakeAllocation{
       fakeLeafPool.get(),
       fakeLeafPool->allocate(kMemoryCapacity / 3),
@@ -2236,6 +2320,155 @@ DEBUG_ONLY_TEST_F(SharedArbitrationTest, asyncArbitratonFromNonDriverContext) {
 
   task.reset();
   waitForAllTasksToBeDeleted();
+}
+
+DEBUG_ONLY_TEST_F(SharedArbitrationTest, arbitrationFromTableWriter) {
+  setupMemory(kMemoryCapacity, 0);
+
+  VectorFuzzer::Options options;
+  const int batchSize = 1000;
+  options.vectorSize = batchSize;
+  VectorFuzzer fuzzer(options, pool());
+  const int numBatches = 10;
+  std::vector<RowVectorPtr> vectors;
+  int numRows{0};
+  for (int i = 0; i < numBatches; ++i) {
+    numRows += batchSize;
+    vectors.push_back(fuzzer.fuzzRow(rowType_));
+  }
+
+  createDuckDbTable(vectors);
+
+  std::shared_ptr<core::QueryCtx> queryCtx = newQueryCtx(kMemoryCapacity);
+  ASSERT_EQ(queryCtx->pool()->capacity(), 0);
+
+  std::atomic<bool> injectArbitrationOnce{true};
+  SCOPED_TESTVALUE_SET(
+      "facebook::velox::memory::MemoryPoolImpl::reserveThreadSafe",
+      std::function<void(memory::MemoryPool*)>([&](memory::MemoryPool* pool) {
+        const std::string dictPoolRe(".*dictionary");
+        const std::string generalPoolRe(".*general");
+        const std::string compressionPoolRe(".*compression");
+        if (!RE2::FullMatch(pool->name(), dictPoolRe) &&
+            !RE2::FullMatch(pool->name(), generalPoolRe) &&
+            !RE2::FullMatch(pool->name(), compressionPoolRe)) {
+          return;
+        }
+        if (pool->currentBytes() == 0) {
+          return;
+        }
+        if (!injectArbitrationOnce.exchange(false)) {
+          return;
+        }
+        const auto fakeAllocationSize =
+            arbitrator_->stats().maxCapacityBytes - pool->currentBytes();
+        VELOX_ASSERT_THROW(
+            pool->allocate(fakeAllocationSize), "Exceeded memory pool");
+      }));
+
+  auto outputDirectory = TempDirectoryPath::create();
+  auto writerPlan = createInsertPlan(
+      PlanBuilder().values(vectors), rowType_, outputDirectory->path);
+
+  AssertQueryBuilder(duckDbQueryRunner_)
+      .queryCtx(queryCtx)
+      .spillDirectory(outputDirectory->path)
+      .config(core::QueryConfig::kSpillEnabled, "true")
+      .config(core::QueryConfig::kJoinSpillEnabled, "true")
+      .config(core::QueryConfig::kJoinSpillPartitionBits, "2")
+      .plan(std::move(writerPlan))
+      .assertResults(fmt::format("SELECT {}", numRows));
+
+  ASSERT_EQ(arbitrator_->stats().numFailures, 1);
+}
+
+DEBUG_ONLY_TEST_F(SharedArbitrationTest, arbitrateMemoryFromOtherOperator) {
+  setupMemory(kMemoryCapacity, 0);
+  const int numVectors = 10;
+  std::vector<RowVectorPtr> vectors;
+  for (int i = 0; i < numVectors; ++i) {
+    vectors.push_back(newVector());
+  }
+  createDuckDbTable(vectors);
+
+  for (bool sameDriver : {false, true}) {
+    SCOPED_TRACE(fmt::format("sameDriver {}", sameDriver));
+    std::shared_ptr<core::QueryCtx> queryCtx = newQueryCtx(kMemoryCapacity);
+    ASSERT_EQ(queryCtx->pool()->capacity(), 0);
+
+    std::atomic<bool> injectAllocationOnce{true};
+    const int initialBufferLen = 1 << 20;
+    std::atomic<void*> buffer{nullptr};
+    std::atomic<MemoryPool*> bufferPool{nullptr};
+    SCOPED_TESTVALUE_SET(
+        "facebook::velox::exec::Values::getOutput",
+        std::function<void(const exec::Values*)>(
+            [&](const exec::Values* values) {
+              if (!injectAllocationOnce.exchange(false)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                return;
+              }
+              buffer = values->pool()->allocate(initialBufferLen);
+              bufferPool = values->pool();
+            }));
+    std::atomic<bool> injectReallocateOnce{true};
+    SCOPED_TESTVALUE_SET(
+        "facebook::velox::common::memory::MemoryPoolImpl::allocateNonContiguous",
+        std::function<void(memory::MemoryPoolImpl*)>(
+            ([&](memory::MemoryPoolImpl* pool) {
+              const std::string re(".*Aggregation");
+              if (!RE2::FullMatch(pool->name(), re)) {
+                return;
+              }
+              if (pool->root()->currentBytes() == 0) {
+                return;
+              }
+              if (!injectReallocateOnce.exchange(false)) {
+                return;
+              }
+              ASSERT_TRUE(buffer != nullptr);
+              ASSERT_TRUE(bufferPool != nullptr);
+              const int newLength =
+                  kMemoryCapacity - bufferPool.load()->capacity() + 1;
+              VELOX_ASSERT_THROW(
+                  bufferPool.load()->reallocate(
+                      buffer, initialBufferLen, newLength),
+                  "Exceeded memory pool cap");
+            })));
+
+    std::shared_ptr<Task> task;
+    std::thread queryThread([&]() {
+      if (sameDriver) {
+        task = AssertQueryBuilder(duckDbQueryRunner_)
+                   .queryCtx(queryCtx)
+                   .plan(PlanBuilder()
+                             .values(vectors)
+                             .singleAggregation({"c0", "c1"}, {"array_agg(c2)"})
+                             .localPartition(std::vector<std::string>{})
+                             .planNode())
+                   .assertResults(
+                       "SELECT c0, c1, array_agg(c2) FROM tmp GROUP BY c0, c1");
+      } else {
+        task = AssertQueryBuilder(duckDbQueryRunner_)
+                   .queryCtx(queryCtx)
+                   .plan(PlanBuilder()
+                             .values(vectors)
+                             .localPartition({"c0", "c1"})
+                             .singleAggregation({"c0", "c1"}, {"array_agg(c2)"})
+                             .planNode())
+                   .assertResults(
+                       "SELECT c0, c1, array_agg(c2) FROM tmp GROUP BY c0, c1");
+      }
+    });
+
+    queryThread.join();
+    ASSERT_TRUE(buffer != nullptr);
+    ASSERT_TRUE(bufferPool != nullptr);
+    bufferPool.load()->free(buffer, initialBufferLen);
+
+    task.reset();
+    waitForAllTasksToBeDeleted();
+  }
 }
 
 TEST_F(SharedArbitrationTest, concurrentArbitration) {

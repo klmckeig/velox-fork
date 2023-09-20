@@ -26,6 +26,8 @@ namespace facebook::velox::memory {
 
 class MemoryPool;
 
+using MemoryArbitrationStateCheckCB = std::function<void(MemoryPool&)>;
+
 /// The memory arbitrator interface. There is one memory arbitrator object per
 /// memory manager which is responsible for arbitrating memory usage among the
 /// query memory pools for query memory isolation. When a memory pool exceeds
@@ -60,13 +62,13 @@ class MemoryArbitrator {
     /// during the memory arbitration.
     uint64_t memoryPoolTransferCapacity{32 << 20};
 
-    /// If true, handle the memory arbitration failure by aborting the memory
-    /// pool with most capacity and retry the memory arbitration, otherwise we
-    /// simply fails the memory arbitration requestor itself. This helps the
-    /// distributed query execution use case such as Prestissimo that fail the
-    /// same query on all the workers instead of a random victim query which
-    /// happens to trigger the failed memory arbitration.
-    bool retryArbitrationFailure{true};
+    /// Provided by the query system to validate the state after a memory pool
+    /// enters arbitration if not null. For instance, Prestissimo provides
+    /// callback to check if a memory arbitration request is issued from a
+    /// driver thread, then the driver should be put in suspended state to avoid
+    /// the potential deadlock when reclaim memory from the task of the request
+    /// memory pool.
+    MemoryArbitrationStateCheckCB arbitrationStateCheckCb{nullptr};
   };
 
   using Factory = std::function<std::unique_ptr<MemoryArbitrator>(
@@ -152,6 +154,8 @@ class MemoryArbitrator {
   struct Stats {
     /// The number of arbitration requests.
     uint64_t numRequests{0};
+    /// The number of succeeded arbitration requests.
+    uint64_t numSucceeded{0};
     /// The number of aborted arbitration requests.
     uint64_t numAborted{0};
     /// The number of arbitration request failures.
@@ -169,9 +173,13 @@ class MemoryArbitrator {
     uint64_t maxCapacityBytes{0};
     /// The free memory capacity in bytes.
     uint64_t freeCapacityBytes{0};
+    /// The sum of all reclaim operation durations during arbitration in
+    /// microseconds.
+    uint64_t reclaimTimeUs{0};
 
     Stats(
         uint64_t _numRequests,
+        uint64_t _numSucceeded,
         uint64_t _numAborted,
         uint64_t _numFailures,
         uint64_t _queueTimeUs,
@@ -179,7 +187,8 @@ class MemoryArbitrator {
         uint64_t _numShrunkBytes,
         uint64_t _numReclaimedBytes,
         uint64_t _maxCapacityBytes,
-        uint64_t _freeCapacityBytes);
+        uint64_t _freeCapacityBytes,
+        uint64_t _reclaimTimeUs);
 
     Stats() = default;
 
@@ -190,6 +199,10 @@ class MemoryArbitrator {
     bool operator>(const Stats& other) const;
     bool operator>=(const Stats& other) const;
     bool operator<=(const Stats& other) const;
+
+    bool empty() const {
+      return numRequests == 0;
+    }
 
     /// Returns the debug string of this stats.
     std::string toString() const;
@@ -204,11 +217,13 @@ class MemoryArbitrator {
   explicit MemoryArbitrator(const Config& config)
       : capacity_(config.capacity),
         memoryPoolInitCapacity_(config.memoryPoolInitCapacity),
-        memoryPoolTransferCapacity_(config.memoryPoolTransferCapacity) {}
+        memoryPoolTransferCapacity_(config.memoryPoolTransferCapacity),
+        arbitrationStateCheckCb_(config.arbitrationStateCheckCb) {}
 
   const uint64_t capacity_;
   const uint64_t memoryPoolInitCapacity_;
   const uint64_t memoryPoolTransferCapacity_;
+  const MemoryArbitrationStateCheckCB arbitrationStateCheckCb_;
 };
 
 FOLLY_ALWAYS_INLINE std::ostream& operator<<(

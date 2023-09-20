@@ -29,6 +29,54 @@
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
+namespace {
+
+// Ensures that the thread is removed from its Task's thread count on exit.
+class CancelGuard {
+ public:
+  CancelGuard(
+      Task* task,
+      ThreadState* state,
+      std::function<void(StopReason)> onTerminate)
+      : task_(task), state_(state), onTerminate_(std::move(onTerminate)) {}
+
+  void notThrown() {
+    isThrow_ = false;
+  }
+
+  ~CancelGuard() {
+    bool onTerminateCalled = false;
+    if (isThrow_) {
+      // Runtime error. Driver is on thread, hence safe.
+      state_->isTerminated = true;
+      onTerminate_(StopReason::kNone);
+      onTerminateCalled = true;
+    }
+    task_->leave(*state_, onTerminateCalled ? nullptr : onTerminate_);
+  }
+
+ private:
+  Task* task_;
+  ThreadState* state_;
+  std::function<void(StopReason reason)> onTerminate_;
+  bool isThrow_ = true;
+};
+
+// Checks if output channel is produced using identity projection and returns
+// input channel if so.
+std::optional<column_index_t> getIdentityProjection(
+    const std::vector<IdentityProjection>& projections,
+    column_index_t outputChannel) {
+  for (const auto& projection : projections) {
+    if (projection.outputChannel == outputChannel) {
+      return projection.inputChannel;
+    }
+  }
+  return std::nullopt;
+}
+
+thread_local DriverThreadContext* driverThreadCtx{nullptr};
+} // namespace
 
 DriverCtx::DriverCtx(
     std::shared_ptr<Task> _task,
@@ -41,7 +89,7 @@ DriverCtx::DriverCtx(
       splitGroupId(_splitGroupId),
       partitionId(_partitionId),
       task(_task),
-      threadDebugInfo({task->queryCtx()->queryId(), task->taskId()}) {}
+      threadDebugInfo({task->queryCtx()->queryId(), task->taskId(), nullptr}) {}
 
 const core::QueryConfig& DriverCtx::queryConfig() const {
   return task->queryCtx()->queryConfig();
@@ -53,7 +101,7 @@ velox::memory::MemoryPool* DriverCtx::addOperatorPool(
   return task->addOperatorPool(planNodeId, pipelineId, driverId, operatorType);
 }
 
-std::optional<Spiller::Config> DriverCtx::makeSpillConfig(
+std::optional<common::SpillConfig> DriverCtx::makeSpillConfig(
     int32_t operatorId) const {
   const auto& queryConfig = task->queryCtx()->queryConfig();
   if (!queryConfig.spillEnabled()) {
@@ -62,10 +110,11 @@ std::optional<Spiller::Config> DriverCtx::makeSpillConfig(
   if (task->spillDirectory().empty()) {
     return std::nullopt;
   }
-  return Spiller::Config(
+  return common::SpillConfig(
       makeOperatorSpillPath(
           task->spillDirectory(), pipelineId, driverId, operatorId),
       queryConfig.maxSpillFileSize(),
+      queryConfig.spillWriteBufferSize(),
       queryConfig.minSpillRunSize(),
       task->queryCtx()->spillExecutor(),
       queryConfig.spillableReservationGrowthPct(),
@@ -134,40 +183,6 @@ void BlockingState::setResume(std::shared_ptr<BlockingState> state) {
           });
 }
 
-namespace {
-
-// Ensures that the thread is removed from its Task's thread count on exit.
-class CancelGuard {
- public:
-  CancelGuard(
-      Task* task,
-      ThreadState* state,
-      std::function<void(StopReason)> onTerminate)
-      : task_(task), state_(state), onTerminate_(std::move(onTerminate)) {}
-
-  void notThrown() {
-    isThrow_ = false;
-  }
-
-  ~CancelGuard() {
-    bool onTerminateCalled = false;
-    if (isThrow_) {
-      // Runtime error. Driver is on thread, hence safe.
-      state_->isTerminated = true;
-      onTerminate_(StopReason::kNone);
-      onTerminateCalled = true;
-    }
-    task_->leave(*state_, onTerminateCalled ? nullptr : onTerminate_);
-  }
-
- private:
-  Task* task_;
-  ThreadState* state_;
-  std::function<void(StopReason reason)> onTerminate_;
-  bool isThrow_ = true;
-};
-} // namespace
-
 std::string stopReasonString(StopReason reason) {
   switch (reason) {
     case StopReason::kNone:
@@ -216,21 +231,6 @@ void Driver::init(
   curOpIndex_ = operators_.size() - 1;
   trackOperatorCpuUsage_ = ctx_->queryConfig().operatorTrackCpuUsage();
 }
-
-namespace {
-// Checks if output channel is produced using identity projection and returns
-// input channel if so.
-std::optional<column_index_t> getIdentityProjection(
-    const std::vector<IdentityProjection>& projections,
-    column_index_t outputChannel) {
-  for (const auto& projection : projections) {
-    if (projection.outputChannel == outputChannel) {
-      return projection.inputChannel;
-    }
-  }
-  return std::nullopt;
-}
-} // namespace
 
 void Driver::initializeOperators() {
   if (operatorsInitialized_) {
@@ -294,6 +294,7 @@ RowVectorPtr Driver::next(std::shared_ptr<BlockingState>& blockingState) {
   auto self = shared_from_this();
   facebook::velox::process::ScopedThreadDebugInfo scopedInfo(
       self->driverCtx()->threadDebugInfo);
+  ScopedDriverThreadContext scopedDriverThreadContext(*self->driverCtx());
   RowVectorPtr result;
   auto stop = runInternal(self, blockingState, result);
 
@@ -327,6 +328,52 @@ void Driver::enqueueInternal() {
         operator->planNodeId(),                                         \
         e.what());                                                      \
   }
+
+CpuWallTiming Driver::processLazyTiming(
+    Operator& op,
+    const CpuWallTiming& timing) {
+  if (&op == operators_[0].get()) {
+    return timing;
+  }
+  auto lockStats = op.stats().wlock();
+  uint64_t cpuDelta = 0;
+  uint64_t wallDelta = 0;
+  auto it = lockStats->runtimeStats.find(LazyVector::kCpuNanos);
+  if (it != lockStats->runtimeStats.end()) {
+    auto cpu = it->second.sum;
+    cpuDelta = cpu >= lockStats->lastLazyCpuNanos
+        ? cpu - lockStats->lastLazyCpuNanos
+        : 0;
+    if (cpuDelta == 0) {
+      // return early if no change. Checking one counter is enough. If
+      // this did not change and the other did, the change would be
+      // insignificant and tracking would catch up when this counter next
+      // changed.
+      return timing;
+    }
+    lockStats->lastLazyCpuNanos = cpu;
+  } else {
+    // Return early if no lazy activity. Lazy CPU and wall times are recorded
+    // together, checking one is enough.
+    return timing;
+  }
+  it = lockStats->runtimeStats.find(LazyVector::kWallNanos);
+  if (it != lockStats->runtimeStats.end()) {
+    auto wall = it->second.sum;
+    wallDelta = wall >= lockStats->lastLazyWallNanos
+        ? wall - lockStats->lastLazyWallNanos
+        : 0;
+    if (wallDelta > 0) {
+      lockStats->lastLazyWallNanos = wall;
+    }
+  }
+  operators_[0]->stats().wlock()->getOutputTiming.add(
+      CpuWallTiming{1, wallDelta, cpuDelta});
+  return CpuWallTiming{
+      1,
+      timing.wallNanos >= wallDelta ? timing.wallNanos - wallDelta : 0,
+      timing.cpuNanos >= cpuDelta ? timing.cpuNanos - cpuDelta : 0};
+}
 
 StopReason Driver::runInternal(
     std::shared_ptr<Driver>& self,
@@ -433,7 +480,8 @@ StopReason Driver::runInternal(
             RowVectorPtr result;
             {
               auto timer = createDeltaCpuWallTimer(
-                  [op](const CpuWallTiming& deltaTiming) {
+                  [op, this](const CpuWallTiming& deltaTiming) {
+                    processLazyTiming(*op, deltaTiming);
                     op->stats().wlock()->getOutputTiming.add(deltaTiming);
                   });
               RuntimeStatWriterScopeGuard statsWriterGuard(op);
@@ -454,8 +502,9 @@ StopReason Driver::runInternal(
             pushdownFilters(i);
             if (result) {
               auto timer = createDeltaCpuWallTimer(
-                  [nextOp](const CpuWallTiming& timing) {
-                    nextOp->stats().wlock()->addInputTiming.add(timing);
+                  [nextOp, this](const CpuWallTiming& timing) {
+                    auto selfDelta = processLazyTiming(*nextOp, timing);
+                    nextOp->stats().wlock()->addInputTiming.add(selfDelta);
                   });
               {
                 auto lockedStats = nextOp->stats().wlock();
@@ -494,8 +543,9 @@ StopReason Driver::runInternal(
               }
               RuntimeStatWriterScopeGuard statsWriterGuard(op);
               if (op->isFinished()) {
-                auto timer =
-                    createDeltaCpuWallTimer([op](const CpuWallTiming& timing) {
+                auto timer = createDeltaCpuWallTimer(
+                    [op, this](const CpuWallTiming& timing) {
+                      processLazyTiming(*op, timing);
                       op->stats().wlock()->finishTiming.add(timing);
                     });
                 RuntimeStatWriterScopeGuard statsWriterGuard(nextOp);
@@ -513,9 +563,10 @@ StopReason Driver::runInternal(
           // this will be detected when trying to add input, and we
           // will come back here after this is again on thread.
           {
-            auto timer =
-                createDeltaCpuWallTimer([op](const CpuWallTiming& timing) {
-                  op->stats().wlock()->getOutputTiming.add(timing);
+            auto timer = createDeltaCpuWallTimer(
+                [op, this](const CpuWallTiming& timing) {
+                  auto selfDelta = processLazyTiming(*op, timing);
+                  op->stats().wlock()->getOutputTiming.add(selfDelta);
                 });
             CALL_OPERATOR(result = op->getOutput(), op, "getOutput");
             if (result) {
@@ -564,6 +615,7 @@ void Driver::run(std::shared_ptr<Driver> self) {
   process::TraceContext trace("Driver::run");
   facebook::velox::process::ScopedThreadDebugInfo scopedInfo(
       self->driverCtx()->threadDebugInfo);
+  ScopedDriverThreadContext scopedDriverThreadContext(*self->driverCtx());
   std::shared_ptr<BlockingState> blockingState;
   RowVectorPtr nullResult;
   auto reason = self->runInternal(self, blockingState, nullResult);
@@ -817,6 +869,20 @@ std::string blockingReasonToString(BlockingReason reason) {
   }
   VELOX_UNREACHABLE();
   return "";
-};
+}
+
+DriverThreadContext* driverThreadContext() {
+  return driverThreadCtx;
+}
+
+ScopedDriverThreadContext::ScopedDriverThreadContext(const DriverCtx& driverCtx)
+    : savedDriverThreadCtx_(driverThreadCtx),
+      currentDriverThreadCtx_{.driverCtx = driverCtx} {
+  driverThreadCtx = &currentDriverThreadCtx_;
+}
+
+ScopedDriverThreadContext::~ScopedDriverThreadContext() {
+  driverThreadCtx = savedDriverThreadCtx_;
+}
 
 } // namespace facebook::velox::exec

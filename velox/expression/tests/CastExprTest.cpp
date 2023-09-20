@@ -71,6 +71,12 @@ class CastExprTest : public functions::test::CastBaseTest {
     });
   }
 
+  void setCastStringToDateIsIso8601(bool value) {
+    queryCtx_->testingOverrideConfigUnsafe({
+        {core::QueryConfig::kCastStringToDateIsIso8601, std::to_string(value)},
+    });
+  }
+
   std::shared_ptr<core::ConstantTypedExpr> makeConstantNullExpr(TypeKind kind) {
     return std::make_shared<core::ConstantTypedExpr>(
         createType(kind, {}), variant(kind));
@@ -672,49 +678,110 @@ TEST_F(CastExprTest, timestampAdjustToTimezoneInvalid) {
 }
 
 TEST_F(CastExprTest, date) {
-  std::vector<std::optional<std::string>> input{
-      "1970-01-01",
-      "2020-01-01",
-      "2135-11-09",
-      "1969-12-27",
-      "1812-04-15",
-      "1920-01-02",
-      std::nullopt,
-  };
-  std::vector<std::optional<int32_t>> result{
-      0,
-      18262,
-      60577,
-      -5,
-      -57604,
-      -18262,
-      std::nullopt,
-  };
+  for (bool isIso8601 : {true, false}) {
+    setCastStringToDateIsIso8601(isIso8601);
+    testCast<std::string, int32_t>(
+        "date",
+        {"1970-01-01",
+         "2020-01-01",
+         "2135-11-09",
+         "1969-12-27",
+         "1812-04-15",
+         "1920-01-02",
+         "12345-12-18",
+         "1970-1-2",
+         "1970-01-2",
+         "1970-1-02",
+         "+1970-01-02",
+         "-1-1-1",
+         " 1970-01-01",
+         std::nullopt},
+        {0,
+         18262,
+         60577,
+         -5,
+         -57604,
+         -18262,
+         3789742,
+         1,
+         1,
+         1,
+         1,
+         -719893,
+         0,
+         std::nullopt},
+        false,
+        false,
+        VARCHAR(),
+        DATE());
+  }
 
+  setCastStringToDateIsIso8601(false);
   testCast<std::string, int32_t>(
-      "date", input, result, false, false, VARCHAR(), DATE());
-
-  setCastIntByTruncate(true);
-  testCast<std::string, int32_t>(
-      "date", input, result, false, false, VARCHAR(), DATE());
+      "date",
+      {"12345",
+       "2015",
+       "2015-03",
+       "2015-03-18T",
+       "2015-03-18T123123",
+       "2015-03-18 123142",
+       "2015-03-18 (BC)"},
+      {3789391, 16436, 16495, 16512, 16512, 16512, 16512},
+      false,
+      false,
+      VARCHAR(),
+      DATE());
 }
 
 TEST_F(CastExprTest, invalidDate) {
-  testCast<int8_t, int32_t>("date", {12}, {0}, true, false, TINYINT(), DATE());
-  testCast<int16_t, int32_t>(
-      "date", {1234}, {0}, true, false, SMALLINT(), DATE());
-  testCast<int32_t, int32_t>(
-      "date", {1234}, {0}, true, false, INTEGER(), DATE());
-  testCast<int64_t, int32_t>(
-      "date", {1234}, {0}, true, false, BIGINT(), DATE());
+  for (bool isIso8601 : {true, false}) {
+    setCastStringToDateIsIso8601(isIso8601);
 
-  testCast<float, int32_t>("date", {12.99}, {0}, true, false, REAL(), DATE());
-  testCast<double, int32_t>(
-      "date", {12.99}, {0}, true, false, DOUBLE(), DATE());
+    testCast<int8_t, int32_t>(
+        "date", {12}, {0}, true, false, TINYINT(), DATE());
+    testCast<int16_t, int32_t>(
+        "date", {1234}, {0}, true, false, SMALLINT(), DATE());
+    testCast<int32_t, int32_t>(
+        "date", {1234}, {0}, true, false, INTEGER(), DATE());
+    testCast<int64_t, int32_t>(
+        "date", {1234}, {0}, true, false, BIGINT(), DATE());
 
-  // Parsing an ill-formated date.
+    testCast<float, int32_t>("date", {12.99}, {0}, true, false, REAL(), DATE());
+    testCast<double, int32_t>(
+        "date", {12.99}, {0}, true, false, DOUBLE(), DATE());
+
+    // Parsing ill-formated dates.
+    testCast<std::string, int32_t>(
+        "date", {"2012-Oct-23"}, {0}, true, false, VARCHAR(), DATE());
+    testCast<std::string, int32_t>(
+        "date", {"2015-03-18X"}, {0}, true, false, VARCHAR(), DATE());
+    testCast<std::string, int32_t>(
+        "date", {"2015/03/18"}, {0}, true, false, VARCHAR(), DATE());
+    testCast<std::string, int32_t>(
+        "date", {"2015.03.18"}, {0}, true, false, VARCHAR(), DATE());
+    testCast<std::string, int32_t>(
+        "date", {"20150318"}, {0}, true, false, VARCHAR(), DATE());
+    testCast<std::string, int32_t>(
+        "date", {"2015-031-8"}, {0}, true, false, VARCHAR(), DATE());
+  }
+
+  setCastStringToDateIsIso8601(true);
   testCast<std::string, int32_t>(
-      "date", {"2012-Oct-23"}, {0}, true, false, VARCHAR(), DATE());
+      "date", {"12345"}, {0}, true, false, VARCHAR(), DATE());
+  testCast<std::string, int32_t>(
+      "date", {"2015-03"}, {0}, true, false, VARCHAR(), DATE());
+  testCast<std::string, int32_t>(
+      "date", {"2015-03-18 123412"}, {0}, true, false, VARCHAR(), DATE());
+  testCast<std::string, int32_t>(
+      "date", {"2015-03-18T"}, {0}, true, false, VARCHAR(), DATE());
+  testCast<std::string, int32_t>(
+      "date", {"2015-03-18T123412"}, {0}, true, false, VARCHAR(), DATE());
+  testCast<std::string, int32_t>(
+      "date", {"2015-03-18 (BC)"}, {0}, true, false, VARCHAR(), DATE());
+  testCast<std::string, int32_t>(
+      "date", {"1970-01-01 "}, {0}, true, false, VARCHAR(), DATE());
+  testCast<std::string, int32_t>(
+      "date", {" 1970-01-01 "}, {0}, true, false, VARCHAR(), DATE());
 }
 
 TEST_F(CastExprTest, primitiveInvalidCornerCases) {
@@ -1459,6 +1526,54 @@ TEST_F(CastExprTest, decimalToBool) {
       {DecimalUtil::kLongDecimalMin, 0, std::nullopt}, DECIMAL(38, 5));
   testComplexCast(
       "c0", longFlat, makeNullableFlatVector<bool>({1, 0, std::nullopt}));
+}
+
+TEST_F(CastExprTest, decimalToVarchar) {
+  auto flatForInline = makeNullableFlatVector<int64_t>(
+      {123456789, -333333333, 0, 5, -9, std::nullopt}, DECIMAL(9, 2));
+  testComplexCast(
+      "c0",
+      flatForInline,
+      makeNullableFlatVector<StringView>(
+          {"1234567.89", "-3333333.33", "0", "0.05", "-0.09", std::nullopt}));
+
+  auto shortFlat = makeNullableFlatVector<int64_t>(
+      {DecimalUtil::kShortDecimalMin,
+       -3,
+       0,
+       55,
+       DecimalUtil::kShortDecimalMax,
+       std::nullopt},
+      DECIMAL(18, 18));
+  testComplexCast(
+      "c0",
+      shortFlat,
+      makeNullableFlatVector<StringView>(
+          {"-0.999999999999999999",
+           "-0.000000000000000003",
+           "0",
+           "0.000000000000000055",
+           "0.999999999999999999",
+           std::nullopt}));
+
+  auto longFlat = makeNullableFlatVector<int128_t>(
+      {DecimalUtil::kLongDecimalMin,
+       0,
+       DecimalUtil::kLongDecimalMax,
+       HugeInt::build(0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull),
+       HugeInt::build(0xffff, 0xffffffffffffffff),
+       std::nullopt},
+      DECIMAL(38, 5));
+  testComplexCast(
+      "c0",
+      longFlat,
+      makeNullableFlatVector<StringView>(
+          {"-999999999999999999999999999999999.99999",
+           "0",
+           "999999999999999999999999999999999.99999",
+           "-0.00001",
+           "12089258196146291747.06175",
+           std::nullopt}));
 }
 
 TEST_F(CastExprTest, decimalToDecimal) {

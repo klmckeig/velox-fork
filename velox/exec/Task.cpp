@@ -470,6 +470,12 @@ RowVectorPtr Task::next(ContinueFuture* future) {
     drivers.reserve(numDriversUngrouped_);
     createSplitGroupStateLocked(kUngroupedGroupId);
     createDriversLocked(self, kUngroupedGroupId, drivers);
+    if (self->pool_->stats().currentBytes != 0) {
+      VELOX_FAIL(
+          "Unexpected memory pool allocations during task[{}] driver initialization: {}",
+          self->taskId_,
+          self->pool_->treeMemoryUsage());
+    }
 
     drivers_ = std::move(drivers);
   }
@@ -540,7 +546,7 @@ void Task::start(
     uint32_t maxDrivers,
     uint32_t concurrentSplitGroups) {
   facebook::velox::process::ThreadDebugInfo threadDebugInfo{
-      self->queryCtx()->queryId(), self->taskId_};
+      self->queryCtx()->queryId(), self->taskId_, nullptr};
   facebook::velox::process::ScopedThreadDebugInfo scopedInfo(threadDebugInfo);
   try {
     VELOX_CHECK_GE(
@@ -665,6 +671,12 @@ void Task::start(
       drivers.reserve(self->numDriversUngrouped_);
       self->createSplitGroupStateLocked(kUngroupedGroupId);
       self->createDriversLocked(self, kUngroupedGroupId, drivers);
+      if (self->pool_->stats().currentBytes != 0) {
+        VELOX_FAIL(
+            "Unexpected memory pool allocations during task[{}] driver initialization: {}",
+            self->taskId_,
+            self->pool_->treeMemoryUsage());
+      }
 
       // Prevent the connecting structures from being cleaned up before all
       // split groups are finished during the grouped execution mode.

@@ -16,6 +16,7 @@
 
 #include "velox/dwio/dwrf/reader/FlatMapColumnReader.h"
 #include <folly/Conv.h>
+#include <folly/container/F14Set.h>
 #include <folly/json.h>
 
 #include "velox/common/base/BitUtil.h"
@@ -77,7 +78,7 @@ uint32_t visitUniqueStreamsOfNode(
     StripeStreams& stripe,
     std::function<void(const StreamInformation&)> visitor) {
   const auto dataValueType = dataType->childAt(1);
-  std::unordered_set<size_t> processed;
+  folly::F14FastSet<size_t> processed;
 
   auto streams = stripe.visitStreamsOfNode(
       dataValueType->id(), [&](const StreamInformation& stream) {
@@ -120,7 +121,7 @@ std::vector<std::unique_ptr<KeyNode<T>>> getKeyNodesFiltered(
 
   const auto requestedValueType = requestedType->childAt(1);
   const auto dataValueType = dataType->childAt(1);
-  std::unordered_set<size_t> processed;
+  folly::F14FastSet<size_t> processed;
 
   // load all sub streams
   // fetch reader, in map bitmap and key object.
@@ -307,9 +308,9 @@ void FlatMapColumnReader<T>::next(
   const auto* nullsPtr = nulls ? nulls->as<uint64_t>() : nullptr;
   uint64_t nullCount = nullsPtr ? bits::countNulls(nullsPtr, 0, numValues) : 0;
 
-  if (mapVector) {
-    detail::resetIfNotWritable(result, offsets, lengths);
-  }
+  // Release extra references of keys and values vectors as well as nulls,
+  // offsets and lengths buffers.
+  result.reset();
 
   if (!offsets) {
     offsets = AlignedBuffer::allocate<vector_size_t>(numValues, &memoryPool_);

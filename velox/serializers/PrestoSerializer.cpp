@@ -97,10 +97,6 @@ bool isChecksumBitSet(int8_t codec) {
 }
 
 std::string typeToEncodingName(const TypePtr& type) {
-  if (type->isDate()) {
-    return "INT_ARRAY";
-  }
-
   switch (type->kind()) {
     case TypeKind::BOOLEAN:
       return "BYTE_ARRAY";
@@ -611,8 +607,7 @@ void readRowVector(
             size,
             pool,
             &offsets,
-            const_cast<const vector_size_t**>(&rawOffsets),
-            0);
+            const_cast<const vector_size_t**>(&rawOffsets));
         for (int32_t child = 0; child < i; ++child) {
           rawOffsets[child] = child;
         }

@@ -111,18 +111,22 @@ class VectorLoader {
 // top-level vector.
 class LazyVector : public BaseVector {
  public:
+  static constexpr const char* kCpuNanos = "dataSourceLazyCpuNanos";
+  static constexpr const char* kWallNanos = "dataSourceLazyWallNanos";
   LazyVector(
       velox::memory::MemoryPool* pool,
       TypePtr type,
       vector_size_t size,
-      std::unique_ptr<VectorLoader>&& loader)
+      std::unique_ptr<VectorLoader>&& loader,
+      VectorPtr&& vector = nullptr)
       : BaseVector(
             pool,
             std::move(type),
             VectorEncoding::Simple::LAZY,
             BufferPtr(nullptr),
             size),
-        loader_(std::move(loader)) {}
+        loader_(std::move(loader)),
+        vector_(std::move(vector)) {}
 
   void reset(std::unique_ptr<VectorLoader>&& loader, vector_size_t size) {
     BaseVector::length_ = size;
@@ -234,6 +238,10 @@ class LazyVector : public BaseVector {
 
   bool isNullAt(vector_size_t index) const override {
     return loadedVector()->isNullAt(index);
+  }
+
+  bool containsNullAt(vector_size_t index) const override {
+    return loadedVector()->containsNullAt(index);
   }
 
   uint64_t retainedSize() const override {

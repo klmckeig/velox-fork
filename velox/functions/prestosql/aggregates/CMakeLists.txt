@@ -23,6 +23,7 @@ add_library(
   BitwiseAggregates.cpp
   BoolAggregates.cpp
   CentralMomentsAggregates.cpp
+  Compare.cpp
   CountIfAggregate.cpp
   CovarianceAggregates.cpp
   ChecksumAggregate.cpp
@@ -36,6 +37,7 @@ add_library(
   MultiMapAggAggregate.cpp
   CountAggregate.cpp
   PrestoHasher.cpp
+  ReduceAgg.cpp
   SetAggregates.cpp
   SumAggregate.cpp
   ValueList.cpp

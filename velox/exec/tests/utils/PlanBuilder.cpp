@@ -24,8 +24,10 @@
 #include "velox/exec/TableWriter.h"
 #include "velox/exec/WindowFunction.h"
 #include "velox/expression/ExprToSubfieldFilter.h"
+#include "velox/expression/FunctionCallToSpecialForm.h"
 #include "velox/expression/SignatureBinder.h"
 #include "velox/parse/Expressions.h"
+#include "velox/parse/TypeResolver.h"
 
 #ifndef VELOX_ENABLE_BACKWARD_COMPATIBILITY
 #include "velox/connectors/hive/TableHandle.h"
@@ -291,6 +293,42 @@ PlanBuilder& PlanBuilder::filter(const std::string& filter) {
   return *this;
 }
 
+PlanBuilder& PlanBuilder::tableWrite(const std::string& outputDirectoryPath) {
+  auto rowType = planNode_->outputType();
+
+  std::vector<std::shared_ptr<const connector::hive::HiveColumnHandle>>
+      columnHandles;
+  for (auto i = 0; i < rowType->size(); ++i) {
+    columnHandles.push_back(std::make_shared<connector::hive::HiveColumnHandle>(
+        rowType->nameOf(i),
+        connector::hive::HiveColumnHandle::ColumnType::kRegular,
+        rowType->childAt(i),
+        rowType->childAt(i)));
+  }
+
+  auto locationHandle = std::make_shared<connector::hive::LocationHandle>(
+      outputDirectoryPath,
+      outputDirectoryPath,
+      connector::hive::LocationHandle::TableType::kNew);
+  auto hiveHandle = std::make_shared<connector::hive::HiveInsertTableHandle>(
+      columnHandles,
+      locationHandle,
+      dwio::common::FileFormat::DWRF,
+      nullptr, // bucketProperty,
+      common::CompressionKind_NONE);
+
+  auto insertHandle =
+      std::make_shared<core::InsertTableHandle>(kHiveConnectorId, hiveHandle);
+
+  return tableWrite(
+      rowType,
+      rowType->names(),
+      nullptr, // aggregationNode
+      insertHandle,
+      false, // hasPartitioningScheme,
+      connector::CommitStrategy::kNoCommit);
+}
+
 PlanBuilder& PlanBuilder::tableWrite(
     const std::vector<std::string>& tableColumnNames,
     const std::shared_ptr<core::AggregationNode>& aggregationNode,
@@ -385,6 +423,21 @@ TypePtr resolveAggregateType(
         aggregateName, rawInputTypes, signatures.value());
   }
 
+  // We may be parsing lambda expression used in a lambda aggregate function. In
+  // this case, 'aggregateName' would refer to a scalar function.
+  //
+  // TODO Enhance the parser to allow for specifying separate resolver for
+  // lambda expressions.
+  if (auto type =
+          exec::resolveTypeForSpecialForm(aggregateName, rawInputTypes)) {
+    return type;
+  }
+
+  if (auto type = parse::resolveScalarFunctionType(
+          aggregateName, rawInputTypes, true)) {
+    return type;
+  }
+
   if (nullOnFailure) {
     return nullptr;
   }
@@ -476,6 +529,14 @@ core::PlanNodePtr PlanBuilder::createIntermediateOrFinalAggregation(
 
     auto type = resolveAggregateType(name, step, rawInputTypes, false);
     std::vector<core::TypedExprPtr> inputs = {field(numGroupingKeys + i)};
+
+    // Add lambda inputs.
+    for (const auto& rawInput : rawInputs) {
+      if (rawInput->type()->kind() == TypeKind::FUNCTION) {
+        inputs.push_back(rawInput);
+      }
+    }
+
     aggregate.call =
         std::make_shared<core::CallTypedExpr>(type, std::move(inputs), name);
     aggregates.emplace_back(aggregate);
