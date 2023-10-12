@@ -29,7 +29,7 @@
 #include <qatseqprod.h>
 
 DEFINE_bool(
-    VELOX_ENABLE_QAT_ZSTD_OT,
+    VELOX_ENABLE_QAT_ZSTD,
     false,
     "if to use qat for zstd compression");
 
@@ -535,7 +535,7 @@ std::unique_ptr<BufferedOutputStream> createCompressor(
       break;
     }
     case CompressionKind::CompressionKind_ZSTD: {
-      if (FLAGS_VELOX_ENABLE_QAT_ZSTD_OT)
+      if (FLAGS_VELOX_ENABLE_QAT_ZSTD)
         compressor = std::make_unique<ZstdQatCompressor>(
           options.format.zstd.compressionLevel);
       else
