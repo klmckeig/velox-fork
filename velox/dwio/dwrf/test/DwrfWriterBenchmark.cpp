@@ -25,6 +25,7 @@
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
+#include <folly/logging/xlog.h>
 
 #include <folly/Benchmark.h>
 #include <folly/init/Init.h>
@@ -33,8 +34,11 @@
 #include <unistd.h> // for syscall()
 #include "velox/tpch/gen/TpchGen.h"
 
-DEFINE_string(table_name, "lineitem", "table name");
-const double scale_factor = 10;
+DEFINE_int32(
+    SCALE_FACTOR,
+    10,
+    "scale factor");
+
 using std::chrono::system_clock;
 
 using namespace ::testing;
@@ -74,47 +78,27 @@ class DwrfWriterBenchmark {
 
   void writeToFile() {
     RowVectorPtr rowVector1;
-    LOG(INFO) << "table name: " << FLAGS_table_name;
+    int base_scale_factor = 1;
+    int total_writes = FLAGS_SCALE_FACTOR / base_scale_factor;
+    XLOG_FIRST_N(INFO, 1) << fmt::format("scale factor: ") << FLAGS_SCALE_FACTOR;
+    XLOG_FIRST_N(INFO, 1) << fmt::format("base scale factor: ") << base_scale_factor;
+    XLOG_FIRST_N(INFO, 1) << fmt::format("total writes: ") << total_writes;
 
     folly::BenchmarkSuspender suspender;
-
-    if (FLAGS_table_name.compare("part") == 0) {
-      rowVector1 = facebook::velox::tpch::genTpchPart(
-          leafPool_.get(), 200000, 0, scale_factor);
-    } else if (FLAGS_table_name.compare("partsupp") == 0) {
-      rowVector1 = facebook::velox::tpch::genTpchPartSupp(
-          leafPool_.get(), 800000, 0, 10);
-    } else if (FLAGS_table_name.compare("orders") == 0) {
-      rowVector1 = facebook::velox::tpch::genTpchOrders(
-          leafPool_.get(), 150000, 0, scale_factor);
-    } else if (FLAGS_table_name.compare("customer") == 0) {
-      rowVector1 = facebook::velox::tpch::genTpchCustomer(
-          leafPool_.get(), 150000, 0, scale_factor);
-    } else if (FLAGS_table_name.compare("lineitem") == 0) {
-      rowVector1 = facebook::velox::tpch::genTpchLineItem(
-          leafPool_.get(), 600000, 0, scale_factor);
-    } else if (FLAGS_table_name.compare("region") == 0) {
-      rowVector1 = facebook::velox::tpch::genTpchRegion(
-          leafPool_.get(), 5, 0, scale_factor);
-    } else if (FLAGS_table_name.compare("supplier") == 0) {
-      rowVector1 = facebook::velox::tpch::genTpchSupplier(
-          leafPool_.get(), 100000, 0, 10);
-    } else if (FLAGS_table_name.compare("nation") == 0) {
-      rowVector1 = facebook::velox::tpch::genTpchNation(
-          leafPool_.get(), 25, 0, scale_factor);
-    }
+    rowVector1 = facebook::velox::tpch::genTpchLineItem(
+          leafPool_.get(), 600000, 0, base_scale_factor);
 
     suspender.dismiss();
 
-    for (int i = 0; i < 10; i++) {
-      LOG(INFO) << "i: " << i << ", num row: " << rowVector1->size()
+    for (int i = 0; i < total_writes; i++) {
+      XLOG(INFO) << "i: " << i << ", num row: " << rowVector1->size()
                 << std::endl;
       writer_->write(rowVector1);
     }
 
     suspender.rehire();
 
-    LOG(INFO) << "success write " << FLAGS_table_name << std::endl;
+    XLOG(INFO) << "success write." << std::endl;
     writer_->flush();
   }
 
