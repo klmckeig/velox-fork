@@ -21,8 +21,8 @@
 #include "velox/dwio/dwrf/common/wrap/dwrf-proto-wrapper.h"
 #include "velox/dwio/dwrf/test/OrcTest.h"
 
-#include <folly/Random.h>
 #include <folly/Benchmark.h>
+#include <folly/Random.h>
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
 
@@ -75,7 +75,6 @@ void generateRandomData(char* data, size_t size, bool letter) {
     }
   }
 }
-
 
 void compress(
     CompressionKind kind,
